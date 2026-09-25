@@ -22,6 +22,7 @@ type MockServer struct {
 	RegisterHandlerFunc    func(domain.List, dns.Handler, int)
 	DeregisterHandlerFunc  func(domain.List, int)
 	UpdateServerConfigFunc func(domains dnsconfig.ServerDomains) error
+	EndBatchFunc           func()
 }
 
 func (m *MockServer) RegisterHandler(domains domain.List, handler dns.Handler, priority int) {
@@ -105,10 +106,7 @@ func (m *MockServer) BeginBatch() {
 
 // EndBatch mock implementation of EndBatch from Server interface
 func (m *MockServer) EndBatch() {
-	// Mock implementation - no-op
-}
-
-// CancelBatch mock implementation of CancelBatch from Server interface
-func (m *MockServer) CancelBatch() {
-	// Mock implementation - no-op
+	if m.EndBatchFunc != nil {
+		m.EndBatchFunc()
+	}
 }
