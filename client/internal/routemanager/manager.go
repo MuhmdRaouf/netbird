@@ -40,6 +40,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/routeselector"
 	"github.com/netbirdio/netbird/client/internal/statemanager"
 	nbnet "github.com/netbirdio/netbird/client/net"
+	"github.com/netbirdio/netbird/client/proto"
 	nbdns "github.com/netbirdio/netbird/dns"
 	"github.com/netbirdio/netbird/route"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
@@ -111,6 +112,7 @@ type DefaultManager struct {
 	disableClientRoutes bool
 	disableServerRoutes bool
 	activeRoutes        map[route.HAUniqueID]client.RouteHandler
+	failedRoutes        string
 	fakeIPManager       *fakeip.Manager
 	dnsForwarderPort    atomic.Uint32
 }
@@ -360,20 +362,12 @@ func (m *DefaultManager) updateSystemRoutes(newRoutes route.HAMap) error {
 
 	var merr *multierror.Error
 
-	// Begin batch mode to avoid calling applyHostConfig() after each DNS handler operation
-	batchStarted := false
+	// Begin batch mode to avoid calling applyHostConfig() after each DNS handler operation.
+	// The batch is always applied: handlers of routes that failed are never registered,
+	// so a single failing route must not keep the others' DNS state from the host.
 	if m.dnsServer != nil {
 		m.dnsServer.BeginBatch()
-		batchStarted = true
-		defer func() {
-			if merr != nil {
-				// On error, cancel batch to discard partial DNS state
-				m.dnsServer.CancelBatch()
-			} else {
-				// On success, apply accumulated DNS changes
-				m.dnsServer.EndBatch()
-			}
-		}()
+		defer m.dnsServer.EndBatch()
 	}
 
 	for id, handler := range toRemove {
@@ -383,6 +377,7 @@ func (m *DefaultManager) updateSystemRoutes(newRoutes route.HAMap) error {
 		delete(m.activeRoutes, id)
 	}
 
+	var failed []string
 	for id, route := range toAdd {
 		params := common.HandlerParams{
 			Route:                route,
@@ -401,13 +396,36 @@ func (m *DefaultManager) updateSystemRoutes(newRoutes route.HAMap) error {
 		handler := client.HandlerFromRoute(params)
 		if err := handler.AddRoute(m.ctx); err != nil {
 			merr = multierror.Append(merr, fmt.Errorf("add route %s: %w", handler.String(), err))
+			failed = append(failed, handler.String())
 			continue
 		}
 		m.activeRoutes[id] = handler
 	}
+	m.reportFailedRoutes(failed)
 
-	_ = batchStarted // Mark as used
 	return nberrors.FormatErrorOrNil(merr)
+}
+
+// reportFailedRoutes publishes an event naming the routes that could not be added. Failed
+// routes are retried on every update, so the event is only published when the set changes.
+func (m *DefaultManager) reportFailedRoutes(failed []string) {
+	slices.Sort(failed)
+	networks := strings.Join(failed, ", ")
+	if networks == m.failedRoutes {
+		return
+	}
+	m.failedRoutes = networks
+	if networks == "" || m.statusRecorder == nil {
+		return
+	}
+
+	m.statusRecorder.PublishEvent(
+		proto.SystemEvent_WARNING,
+		proto.SystemEvent_NETWORK,
+		"Routes not added: "+networks,
+		fmt.Sprintf("Could not add routes for %s. Check for conflicts with your network.", networks),
+		map[string]string{"networks": networks},
+	)
 }
 
 func (m *DefaultManager) UpdateRoutes(
